@@ -62,23 +62,18 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 throw new ArgumentNullException("handler");
             }
 
-            return CreateSubsciptions(new ServiceBusConnectionContext(topicNames, handler, errorHandler));
-        }
+            _trace.TraceInformation("Subscribing to {0} topic(s) in the service bus...", topicNames.Count);
 
-        private ServiceBusSubscription CreateSubsciptions(ServiceBusConnectionContext connectionContext)
-        {
-            _trace.TraceInformation("Subscribing to {0} topic(s) in the service bus...", connectionContext.TopicNames.Count);
+            var subscriptions = new ServiceBusSubscription.SubscriptionContext[topicNames.Count];
+            var clients = new TopicClient[topicNames.Count];
 
-            var subscriptions = new ServiceBusSubscription.SubscriptionContext[connectionContext.TopicNames.Count];
-            var clients = new TopicClient[connectionContext.TopicNames.Count];
-
-            for (var topicIndex = 0; topicIndex < connectionContext.TopicNames.Count; ++topicIndex)
+            for (var topicIndex = 0; topicIndex < topicNames.Count; ++topicIndex)
             {
                 while (true)
                 {
                     try
                     {
-                        CreateTopic(connectionContext, ref subscriptions[topicIndex], ref clients[topicIndex], topicIndex);
+                        CreateTopic(new ServiceBusConnectionContext(subscriptions, clients, topicNames, handler, errorHandler), topicIndex);
                         break;
                     }
                     catch (UnauthorizedAccessException ex)
@@ -112,18 +107,18 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 }
             }
 
-            _trace.TraceInformation("Subscription to {0} topics in the service bus Topic service completed successfully.", connectionContext.TopicNames.Count);
+            _trace.TraceInformation("Subscription to {0} topics in the service bus Topic service completed successfully.", topicNames.Count);
 
             return new ServiceBusSubscription(_configuration, _namespaceManager, subscriptions, clients);
         }
 
-        private void CreateTopicInLoop(ServiceBusConnectionContext connectionContext, ref ServiceBusSubscription.SubscriptionContext subscription, ref TopicClient client, int topicIndex)
+        private void CreateTopicWithRetry(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
             try
             {
                 while (true)
                 {
-                    CreateTopic(connectionContext, ref subscription, ref client, topicIndex);
+                    CreateTopic(connectionContext, topicIndex);
                     break;
                 }
             }
@@ -156,7 +151,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
         }
 
-        private void CreateTopic(ServiceBusConnectionContext connectionContext, ref ServiceBusSubscription.SubscriptionContext subscription, ref TopicClient client, int topicIndex)
+        private void CreateTopic(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
             string topicName = connectionContext.TopicNames[topicIndex];
 
@@ -178,14 +173,14 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
 
             // Create a client for this topic
-            client = TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName);
+            connectionContext.TopicCLients[topicIndex] = TopicClient.CreateFromConnectionString(_configuration.ConnectionString, topicName);
 
             _trace.TraceInformation("Creation of a new topic client {0} completed successfully.", topicName);
 
-            CreateSubscription(connectionContext, ref subscription, ref client, topicIndex);
+            CreateSubscription(connectionContext, topicIndex);
         }
 
-        private void CreateSubscription(ServiceBusConnectionContext connectionContext, ref ServiceBusSubscription.SubscriptionContext subscription, ref TopicClient client, int topicIndex)
+        private void CreateSubscription(ServiceBusConnectionContext connectionContext, int topicIndex)
         {
             string topicName = connectionContext.TopicNames[topicIndex];
 
@@ -215,9 +210,10 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
             _trace.TraceInformation("Creation of a message receive for subscription entity path {0} in the service bus completed successfully.", subscriptionEntityPath);
 
-            subscription = new ServiceBusSubscription.SubscriptionContext(topicName, subscriptionName, receiver);
 
-            var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext, subscription, client);
+            connectionContext.Subscriptions[topicIndex] = new ServiceBusSubscription.SubscriptionContext(topicName, subscriptionName, receiver);
+
+            var receiverContext = new ReceiverContext(topicIndex, receiver, connectionContext);
 
             ProcessMessages(receiverContext);
         }
@@ -267,11 +263,10 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                     }
                 }
             }
-            catch (OperationCanceledException ex)
+            catch (OperationCanceledException)
             {
                 // This means the channel is closed
                 _trace.TraceError("OperationCanceledException was thrown in trying to receive the message from the service bus.");
-                receiverContext.OnError(ex);
 
                 return;
             }
@@ -280,6 +275,7 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
                 _trace.TraceError(ex.Message);
                 receiverContext.OnError(ex);
 
+                Thread.Sleep(RetryDelay);
                 goto receive;
                 // REVIEW: What should we do here?
             }
@@ -316,7 +312,8 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
             }
             catch (MessagingEntityNotFoundException)
             {
-                CreateTopic(receiverContext.ConnectionContext, ref receiverContext.Subscription, ref receiverContext.Client, receiverContext.TopicIndex);
+                receiverContext.Receiver.Close();
+                CreateTopicWithRetry(receiverContext.ConnectionContext, receiverContext.TopicIndex);
 
                 return false;
             }
@@ -348,29 +345,22 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
         private class ReceiverContext
         {
             public readonly MessageReceiver Receiver;
-
             public readonly ServiceBusConnectionContext ConnectionContext;
-            public ServiceBusSubscription.SubscriptionContext Subscription;
-            public TopicClient Client;
+
+            public int TopicIndex { get; private set; }
+            public TimeSpan ReceiveTimeout { get; set; }
+            public int ReceiveBatchSize { get; set; }
 
             public ReceiverContext(int topicIndex,
                                    MessageReceiver receiver,
-                                   ServiceBusConnectionContext connectionContext,
-                                   ServiceBusSubscription.SubscriptionContext subscription,
-                                   TopicClient client)
+                                   ServiceBusConnectionContext connectionContext)
             {
                 TopicIndex = topicIndex;
                 Receiver = receiver;
                 ReceiveTimeout = DefaultReadTimeout;
                 ReceiveBatchSize = DefaultReceiveBatchSize;
                 ConnectionContext = connectionContext;
-                Subscription = subscription;
-                Client = client;
             }
-
-            public int TopicIndex { get; private set; }
-            public TimeSpan ReceiveTimeout { get; set; }
-            public int ReceiveBatchSize { get; set; }
 
             public void OnError(Exception ex)
             {
@@ -385,12 +375,17 @@ namespace Microsoft.AspNet.SignalR.ServiceBus
 
         private class ServiceBusConnectionContext
         {
+            public readonly ServiceBusSubscription.SubscriptionContext[] Subscriptions;
+            public readonly TopicClient[] TopicCLients;
+
             public readonly IList<string> TopicNames;
             public readonly Action<int, IEnumerable<BrokeredMessage>> Handler;
             public readonly Action<int, Exception> ErrorHandler;
 
-            public ServiceBusConnectionContext(IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
+            public ServiceBusConnectionContext(ServiceBusSubscription.SubscriptionContext[] subscriptions, TopicClient[] topicClients, IList<string> topicNames, Action<int, IEnumerable<BrokeredMessage>> handler, Action<int, Exception> errorHandler)
             {
+                Subscriptions = subscriptions;
+                TopicCLients = topicClients;
                 TopicNames = topicNames;
                 Handler = handler;
                 ErrorHandler = errorHandler;
